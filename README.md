@@ -139,3 +139,6 @@ It's very similar to Claude Code in terms of capability. Here are the key differ
 ---
 
 **Join our community** [Discord](https://discord.gg/opencode) | [X.com](https://x.com/opencode)
+
+### Note from User
+This fork (git@github.com:rihanciara/opencode.git) has been modified to use Google Cloud "GenAI App Builder" free credits (Vertex AI Search/Discovery Engine) instead of traditional API endpoints that charge per token.
