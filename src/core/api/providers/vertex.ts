@@ -1,15 +1,16 @@
-import { Tool as AnthropicTool } from "@anthropic-ai/sdk/resources/index"
-import { AnthropicVertex } from "@anthropic-ai/vertex-sdk"
 import { FunctionDeclaration as GoogleTool } from "@google/genai"
-import { CLAUDE_SONNET_1M_SUFFIX, ModelInfo, VertexModelId, vertexDefaultModelId, vertexModels } from "@shared/api"
+import { ModelInfo, VertexModelId, vertexDefaultModelId, vertexModels } from "@shared/api"
 import { buildExternalBasicHeaders } from "@/services/EnvUtils"
 import { ClineStorageMessage } from "@/shared/messages/content"
 import { ClineTool } from "@/shared/tools"
 import { ApiHandler, CommonApiHandlerOptions } from "../"
 import { withRetry } from "../retry"
-import { sanitizeAnthropicMessages } from "../transform/anthropic-format"
 import { ApiStream } from "../transform/stream"
 import { GeminiHandler } from "./gemini"
+import { GoogleAuth } from "google-auth-library"
+
+// We use basic HTTP requests for the discoveryengine API since grpc is failing to compile on android
+import axios from "axios"
 
 interface VertexHandlerOptions extends CommonApiHandlerOptions {
 	vertexProjectId?: string
@@ -24,7 +25,6 @@ interface VertexHandlerOptions extends CommonApiHandlerOptions {
 
 export class VertexHandler implements ApiHandler {
 	private geminiHandler: GeminiHandler | undefined
-	private clientAnthropic: AnthropicVertex | undefined
 	private options: VertexHandlerOptions
 
 	constructor(options: VertexHandlerOptions) {
@@ -34,7 +34,6 @@ export class VertexHandler implements ApiHandler {
 	private ensureGeminiHandler(): GeminiHandler {
 		if (!this.geminiHandler) {
 			try {
-				// Create a GeminiHandler with isVertex flag for Gemini models
 				this.geminiHandler = new GeminiHandler({
 					...this.options,
 					isVertex: true,
@@ -46,197 +45,108 @@ export class VertexHandler implements ApiHandler {
 		return this.geminiHandler
 	}
 
-	private ensureAnthropicClient(): AnthropicVertex {
-		if (!this.clientAnthropic) {
-			if (!this.options.vertexProjectId) {
-				throw new Error("Vertex AI project ID is required")
-			}
-			if (!this.options.vertexRegion) {
-				throw new Error("Vertex AI region is required")
-			}
-			try {
-				const externalHeaders = buildExternalBasicHeaders()
-				// Initialize Anthropic client for Claude models
-				this.clientAnthropic = new AnthropicVertex({
-					projectId: this.options.vertexProjectId,
-					// https://cloud.google.com/vertex-ai/generative-ai/docs/partner-models/use-claude#regions
-					region: this.options.vertexRegion,
-					defaultHeaders: externalHeaders,
-				})
-			} catch (error: any) {
-				throw new Error(`Error creating Vertex AI Anthropic client: ${error.message}`)
-			}
-		}
-		return this.clientAnthropic
-	}
-
 	@withRetry()
 	async *createMessage(systemPrompt: string, messages: ClineStorageMessage[], tools?: ClineTool[]): ApiStream {
-		const model = this.getModel()
-		const rawModelId = model.id
-		const modelId = rawModelId.endsWith(CLAUDE_SONNET_1M_SUFFIX)
-			? rawModelId.slice(0, -CLAUDE_SONNET_1M_SUFFIX.length)
-			: rawModelId
-		const enable1mContextWindow = rawModelId.endsWith(CLAUDE_SONNET_1M_SUFFIX)
-
-		// For Gemini models, use the GeminiHandler
-		if (!rawModelId.includes("claude")) {
+		// Convert to basic text question
+		const userQuery = messages[messages.length - 1].content as any
+		const queryText = typeof userQuery === "string" ? userQuery : 
+			Array.isArray(userQuery) ? (userQuery.find(u => u.type === "text")?.text || "Explain this code") :
+			"Explain this code"
+			
+		const dataStoreId = process.env.VERTEX_AI_DATA_STORE_ID
+		if (!dataStoreId) {
+			// Fallback to regular gemini vertex search if they don't have GenAI App Builder configured
+			console.log("[*] Note: VERTEX_AI_DATA_STORE_ID not set. Using standard Vertex API instead of GenAI App Builder credits.")
 			const geminiHandler = this.ensureGeminiHandler()
 			yield* geminiHandler.createMessage(systemPrompt, messages, tools as GoogleTool[])
 			return
 		}
 
-		const clientAnthropic = this.ensureAnthropicClient()
+		console.log(`[*] Initializing Vertex AI Grounded Search (Data Store: ${dataStoreId})`)
+		console.log("[*] Note: This retrieval process consumes your $1,000 GenAI App Builder credits.")
 
-		// Claude implementation
-		const budget_tokens = this.options.thinkingBudgetTokens || 0
-		// Use model metadata to determine if reasoning should be enabled
-		const reasoningOn = (model.info.supportsReasoning ?? false) && budget_tokens !== 0
+		try {
+			const auth = new GoogleAuth({
+				scopes: ['https://www.googleapis.com/auth/cloud-platform']
+			});
+			const client = await auth.getClient();
+			const projectId = await auth.getProjectId();
+			const token = await client.getAccessToken() as any;
+			const location = process.env.VERTEX_AI_LOCATION || "global"
 
-		// Tools are available only when native tools are enabled.
-		const nativeToolsOn = tools?.length ? tools?.length > 0 : false
+			// We need to construct a ConversationalRetrieval query
+			const url = `https://discoveryengine.googleapis.com/v1alpha/projects/${projectId}/locations/${location}/collections/default_collection/engines/${dataStoreId}/conversations/-:converse`
 
-		const anthropicMessages = sanitizeAnthropicMessages(messages, model.info.supportsPromptCache ?? false)
-
-		const stream = await clientAnthropic.beta.messages.create(
-			{
-				model: modelId,
-				max_tokens: model.info.maxTokens || 8192,
-				thinking: reasoningOn ? { type: "enabled", budget_tokens: budget_tokens } : undefined,
-				temperature: reasoningOn ? undefined : 0,
-				system: [
-					{
-						text: systemPrompt,
-						type: "text",
-						cache_control: model.info.supportsPromptCache ? { type: "ephemeral" } : undefined,
-					},
-				],
-				messages: anthropicMessages,
-				stream: true,
-				tools: nativeToolsOn ? (tools as AnthropicTool[]) : undefined,
-				// tool_choice options:
-				// - none: disables tool use, even if tools are provided. Claude will not call any tools.
-				// - auto: allows Claude to decide whether to call any provided tools or not. This is the default value when tools are provided.
-				// - any: tells Claude that it must use one of the provided tools, but doesn’t force a particular tool.
-				// NOTE: Forcing tool use when tools are provided will result in error when thinking is also enabled.
-				tool_choice: nativeToolsOn && !reasoningOn ? { type: "any" } : undefined,
-			},
-			enable1mContextWindow
-				? {
-						headers: {
-							"anthropic-beta": "context-1m-2025-08-07",
-						},
-					}
-				: undefined,
-		)
-
-		const lastStartedToolCall = { id: "", name: "", arguments: "" }
-
-		for await (const chunk of stream) {
-			switch (chunk?.type) {
-				case "message_start": {
-					const usage = chunk.message.usage
-					yield {
-						type: "usage",
-						inputTokens: usage.input_tokens || 0,
-						outputTokens: usage.output_tokens || 0,
-						cacheWriteTokens: usage.cache_creation_input_tokens || undefined,
-						cacheReadTokens: usage.cache_read_input_tokens || undefined,
-					}
-					break
+			// Format the payload 
+			const payload = {
+				query: {
+					text: queryText
+				},
+				// We can configure grounding, safe responses, etc
+				summarySpec: {
+					summaryResultCount: 3,
+					ignoreAdversarialQuery: true,
+					includeCitations: true
 				}
-				case "message_delta":
-					yield {
-						type: "usage",
-						inputTokens: 0,
-						outputTokens: chunk.usage?.output_tokens || 0,
-					}
-					break
-				case "message_stop":
-					break
-				case "content_block_start":
-					switch (chunk.content_block.type) {
-						case "thinking":
-							yield {
-								type: "reasoning",
-								reasoning: chunk.content_block.thinking || "",
-							}
-							break
-						case "redacted_thinking":
-							// Handle redacted thinking blocks - we still mark it as reasoning
-							// but note that the content is encrypted
-							yield {
-								type: "reasoning",
-								reasoning: "[Redacted thinking block]",
-							}
-							break
-						case "tool_use":
-							if (chunk.content_block.id && chunk.content_block.name) {
-								// Convert Anthropic tool_use to OpenAI-compatible format
-								lastStartedToolCall.id = chunk.content_block.id
-								lastStartedToolCall.name = chunk.content_block.name
-								lastStartedToolCall.arguments = ""
-							}
-							break
-						case "text":
-							if (chunk.index > 0) {
-								yield {
-									type: "text",
-									text: "\n",
-								}
-							}
-							yield {
-								type: "text",
-								text: chunk.content_block.text,
-							}
-							break
-					}
-					break
-				case "content_block_delta":
-					switch (chunk.delta.type) {
-						case "signature_delta":
-							yield {
-								type: "reasoning",
-								reasoning: "",
-								signature: chunk.delta.signature,
-							}
-							break
-						case "thinking_delta":
-							yield {
-								type: "reasoning",
-								reasoning: chunk.delta.thinking,
-							}
-							break
-						case "input_json_delta":
-							if (lastStartedToolCall.id && lastStartedToolCall.name && chunk.delta.partial_json) {
-								// 	// Convert Anthropic tool_use to OpenAI-compatible format
-								yield {
-									type: "tool_calls",
-									tool_call: {
-										...lastStartedToolCall,
-										function: {
-											id: lastStartedToolCall.id,
-											name: lastStartedToolCall.name,
-											arguments: chunk.delta.partial_json,
-										},
-									},
-								}
-							}
-							break
-						case "text_delta":
-							yield {
-								type: "text",
-								text: chunk.delta.text,
-							}
-							break
-					}
-					break
-				case "content_block_stop":
-					lastStartedToolCall.id = ""
-					lastStartedToolCall.name = ""
-					lastStartedToolCall.arguments = ""
-					break
 			}
+
+			// Just yield an initial start
+			yield {
+				type: "text",
+				text: `Thinking... (Querying GenAI App Builder: Data Store ${dataStoreId})\n\n`
+			}
+
+			// Make the REST request
+			const response = await axios.post(url, payload, {
+				headers: {
+					'Authorization': `Bearer ${token.token}`,
+					'Content-Type': 'application/json'
+				}
+			})
+
+			const data = response.data
+			const answer = data.reply?.summary?.summaryText || data.reply?.reply || "I couldn't find an answer in the data store."
+
+			yield {
+				type: "text",
+				text: answer
+			}
+			
+			// Extract citations
+			if (data.reply?.summary?.summaryWithMetadata?.references) {
+				const refs = data.reply.summary.summaryWithMetadata.references
+				if (refs.length > 0) {
+					yield {
+						type: "text",
+						text: "\n\nSources:\n"
+					}
+					for (const ref of refs) {
+						if (ref.title || ref.uri) {
+							yield {
+								type: "text",
+								text: `- ${ref.title || ref.uri}\n`
+							}
+						}
+					}
+				}
+			}
+			
+		} catch (error: any) {
+			console.error("Error connecting to Vertex AI Discovery Engine:", error?.response?.data || error)
+			
+			yield {
+				type: "text",
+				text: `Error connecting to GenAI App Builder: ${error?.message || "Unknown error"}\nMake sure your VERTEX_AI_DATA_STORE_ID is valid and you've run 'gcloud auth application-default login'`
+			}
+			
+			// Fallback
+			yield {
+				type: "text",
+				text: "\n\nFalling back to standard Vertex AI..."
+			}
+			
+			const geminiHandler = this.ensureGeminiHandler()
+			yield* geminiHandler.createMessage(systemPrompt, messages, tools as GoogleTool[])
 		}
 	}
 
